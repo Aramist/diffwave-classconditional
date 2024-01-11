@@ -13,14 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
-import numpy as np
 import os
 import random
+from glob import glob
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio
-
-from glob import glob
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -39,7 +39,28 @@ class ConditionalDataset(torch.utils.data.Dataset):
         spec_filename = f"{audio_filename}.spec.npy"
         signal, _ = torchaudio.load(audio_filename)
         spectrogram = np.load(spec_filename)
-        return {"audio": signal[0], "spectrogram": spectrogram.T}
+        return {"audio": signal[0], "spectrogram": spectrogram.T, "class": None}
+
+
+class ClassConditionalDataset(torch.utils.data.Dataset):
+    def __init__(self, paths):
+        super().__init__()
+        self.filenames = []
+        for path in paths:
+            self.filenames += glob(f"{path}/**/*.wav", recursive=True)
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        audio_filename = self.filenames[idx]
+        class_filename = f"{audio_filename}.class.npy"
+        signal, _ = torchaudio.load(audio_filename)
+        return {
+            "audio": signal[0],
+            "spectrogram": None,
+            "class": np.load(class_filename),
+        }
 
 
 class UnconditionalDataset(torch.utils.data.Dataset):
@@ -54,19 +75,26 @@ class UnconditionalDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         audio_filename = self.filenames[idx]
-        spec_filename = f"{audio_filename}.spec.npy"
         signal, _ = torchaudio.load(audio_filename)
-        return {"audio": signal[0], "spectrogram": None}
+        return {"audio": signal[0], "spectrogram": None, "class": None}
 
 
 class Collator:
     def __init__(self, params):
         self.params = params
 
+        # for backward compatability, support boolean type for cond_type
+        if isinstance(self.params.conditioning, bool):
+            self.cond_type = "spectrogram" if self.params.conditioning else "none"
+        else:
+            self.cond_type = self.params.conditioning.lower()
+        if self.cond_type not in ["spectrogram", "class", "none"]:
+            raise ValueError(f"Unknown conditioning type: {self.cond_type}")
+
     def collate(self, minibatch):
         samples_per_frame = self.params.hop_samples
         for record in minibatch:
-            if self.params.unconditional:
+            if self.cond_type == "none":
                 # Filter out records that aren't long enough.
                 if len(record["audio"]) < self.params.audio_len:
                     del record["spectrogram"]
@@ -83,7 +111,7 @@ class Collator:
                     (0, (end - start) - len(record["audio"])),
                     mode="constant",
                 )
-            else:
+            elif self.cond_type == "spectrogram":
                 # Filter out records that aren't long enough.
                 if len(record["spectrogram"]) < self.params.crop_mel_frames:
                     del record["spectrogram"]
@@ -105,18 +133,39 @@ class Collator:
                     mode="constant",
                 )
 
-        audio = np.stack([record["audio"] for record in minibatch if "audio" in record])
-        if self.params.unconditional:
-            return {
-                "audio": torch.from_numpy(audio),
-                "spectrogram": None,
-            }
-        spectrogram = np.stack(
-            [record["spectrogram"] for record in minibatch if "spectrogram" in record]
+        audio = torch.from_numpy(
+            np.stack(
+                [record["audio"] for record in minibatch if "audio" in record], axis=0
+            )
         )
+        spec = torch.from_numpy(
+            np.stack(
+                [
+                    record["spectrogram"]
+                    for record in minibatch
+                    if "spectrogram" in record
+                ],
+                axis=0,
+            )
+        )
+        class_embed = torch.from_numpy(
+            np.stack(
+                [record["class"] for record in minibatch if "class" in record], axis=0
+            )
+        )
+
+        if self.cond_type == "class":
+            spec = None
+        elif self.cond_type == "spectrogram":
+            class_embed = None
+        elif self.cond_type == "none":
+            spec = None
+            class_embed = None
+
         return {
-            "audio": torch.from_numpy(audio),
-            "spectrogram": torch.from_numpy(spectrogram),
+            "audio": audio,
+            "spectrogram": spec,
+            "class": class_embed,
         }
 
     # for gtzan
@@ -151,7 +200,7 @@ class Collator:
 
 
 def from_path(data_dirs, params, is_distributed=False):
-    if params.unconditional:
+    if params.cond_type == "spec":
         dataset = UnconditionalDataset(data_dirs)
     else:  # with condition
         dataset = ConditionalDataset(data_dirs)

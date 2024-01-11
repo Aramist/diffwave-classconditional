@@ -13,16 +13,16 @@
 # limitations under the License.
 # ==============================================================================
 
-import numpy as np
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
-
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from diffwave.dataset import from_path, from_gtzan
+from diffwave.dataset import from_gtzan, from_path
 from diffwave.model import DiffWave
 from diffwave.params import AttrDict
 
@@ -124,8 +124,10 @@ class DiffWaveLearner:
                 if self.is_master:
                     if self.step % 50 == 0:
                         self._write_summary(self.step, features, loss)
+                        self._write_sample_inference(self.step, features, loss)
                     if self.step % len(self.dataset) == 0:
                         self.save_to_checkpoint()
+                        self._write_sample_inference(self.step, features, loss)
                 self.step += 1
 
     def train_step(self, features):
@@ -133,7 +135,12 @@ class DiffWaveLearner:
             param.grad = None
 
         audio = features["audio"]
-        spectrogram = features["spectrogram"]
+        if self.params.cond_type == "spec":
+            conditioner = features["spectrogram"]
+        elif self.params.cond_type == "class":
+            conditioner = features["class"]
+        else:
+            conditioner = None
 
         N, T = audio.shape
         device = audio.device
@@ -148,7 +155,7 @@ class DiffWaveLearner:
             noise = torch.randn_like(audio)
             noisy_audio = noise_scale_sqrt * audio + (1.0 - noise_scale) ** 0.5 * noise
 
-            predicted = self.model(noisy_audio, t, spectrogram)
+            predicted = self.model(noisy_audio, t, conditioner)
             loss = self.loss_fn(noise, predicted.squeeze(1))
 
         self.scaler.scale(loss).backward()
@@ -160,6 +167,88 @@ class DiffWaveLearner:
         self.scaler.update()
         return loss
 
+    def _write_sample_inference(self, step, features, loss):
+        if features["class"] is None:
+            return
+        device = next(self.model.parameters()).device
+        model = self.model
+        model.eval()
+
+        sample_class = features["class"][0]
+        sample_class = sample_class.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            # Change in notation from the DiffWave paper for fast sampling.
+            # DiffWave paper -> Implementation below
+            # --------------------------------------
+            # alpha -> talpha
+            # beta -> training_noise_schedule
+            # gamma -> alpha
+            # eta -> beta
+            training_noise_schedule = np.array(self.params.noise_schedule)
+            inference_noise_schedule = np.array(self.params.inference_noise_schedule)
+
+            talpha = 1 - training_noise_schedule
+            talpha_cum = np.cumprod(talpha)
+
+            beta = inference_noise_schedule
+            alpha = 1 - beta
+            alpha_cum = np.cumprod(alpha)
+
+            T = []
+            for s in range(len(inference_noise_schedule)):
+                for t in range(len(training_noise_schedule) - 1):
+                    if talpha_cum[t + 1] <= alpha_cum[s] <= talpha_cum[t]:
+                        twiddle = (talpha_cum[t] ** 0.5 - alpha_cum[s] ** 0.5) / (
+                            talpha_cum[t] ** 0.5 - talpha_cum[t + 1] ** 0.5
+                        )
+                        T.append(t + twiddle)
+                        break
+            T = np.array(T, dtype=np.float32)
+
+            conditioner = None
+            audio = torch.randn(1, self.params.audio_len, device=device)
+            conditioner = sample_class
+
+            for n in range(len(alpha) - 1, -1, -1):
+                c1 = 1 / alpha[n] ** 0.5
+                c2 = beta[n] / (1 - alpha_cum[n]) ** 0.5
+                audio = c1 * (
+                    audio
+                    - c2
+                    * model(
+                        audio, torch.tensor([T[n]], device=audio.device), conditioner
+                    ).squeeze(1)
+                )
+                if n > 0:
+                    noise = torch.randn_like(audio)
+                    sigma = (
+                        (1.0 - alpha_cum[n - 1]) / (1.0 - alpha_cum[n]) * beta[n]
+                    ) ** 0.5
+                    audio += sigma * noise
+                audio = torch.clamp(audio, -1.0, 1.0)
+
+            # convert to spectrogram and write
+            audio_spec = torch.stft(
+                audio.squeeze(0),
+                n_fft=512,
+                hop_length=128,
+                win_length=512,
+                return_complex=True,
+            )
+            audio_spec = torch.abs(audio_spec)
+            audio_spec = torch.log(audio_spec**2 + 1e-5)
+            # flip ud so that low frequencies are at the bottom
+            audio_spec = torch.flip(audio_spec, [0])
+        writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)
+        writer.add_image(
+            "inference/spectrogram",
+            audio_spec.unsqueeze(0),
+            step,
+        )
+
+        self.model.train()
+
     def _write_summary(self, step, features, loss):
         writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)
         writer.add_audio(
@@ -168,12 +257,14 @@ class DiffWaveLearner:
             step,
             sample_rate=self.params.sample_rate,
         )
-        if not self.params.unconditional:
+        if self.params.cond_type == "spec":
             writer.add_image(
                 "feature/spectrogram",
                 torch.flip(features["spectrogram"][:1], [1]),
                 step,
             )
+        # elif self.params.cond_type == "class":
+        # writer.add_embedding("feature/class", features["class"][:1], step)
         writer.add_scalar("train/loss", loss, step)
         writer.add_scalar("train/grad_norm", self.grad_norm, step)
         writer.flush()

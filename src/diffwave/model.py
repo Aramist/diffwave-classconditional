@@ -13,16 +13,14 @@
 # limitations under the License.
 # ==============================================================================
 
+from math import sqrt
+from typing import Literal
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from math import sqrt
-
-
-Linear = nn.Linear
-ConvTranspose2d = nn.ConvTranspose2d
+from torch.nn import ConvTranspose2d, Linear
 
 
 def Conv1d(*args, **kwargs):
@@ -32,7 +30,7 @@ def Conv1d(*args, **kwargs):
 
 
 @torch.jit.script
-def silu(x):
+def swish(x):
     return x * torch.sigmoid(x)
 
 
@@ -51,9 +49,9 @@ class DiffusionEmbedding(nn.Module):
         else:
             x = self._lerp_embedding(diffusion_step)
         x = self.projection1(x)
-        x = silu(x)
+        x = swish(x)
         x = self.projection2(x)
-        x = silu(x)
+        x = swish(x)
         return x
 
     def _lerp_embedding(self, t):
@@ -69,6 +67,15 @@ class DiffusionEmbedding(nn.Module):
         table = steps * 10.0 ** (dims * 4.0 / 63.0)  # [T,64]
         table = torch.cat([torch.sin(table), torch.cos(table)], dim=1)
         return table
+
+
+class Unsqueeze(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.unsqueeze(self.dim)
 
 
 class SpectrogramUpsampler(nn.Module):
@@ -87,8 +94,28 @@ class SpectrogramUpsampler(nn.Module):
         return x
 
 
+class ClassEmbeddingUpsampler(nn.Module):
+    def __init__(self, d_class):
+        super().__init__()
+        self.proj1 = Linear(d_class, 512)
+        self.proj2 = Linear(512, d_class)
+
+    def forward(self, x):
+        x = self.proj1(x)
+        x = F.leaky_relu(x, 0.4)
+        x = self.proj2(x)
+        x = F.leaky_relu(x, 0.4)
+        return x  # [B, d_cond]
+
+
 class ResidualBlock(nn.Module):
-    def __init__(self, n_mels, residual_channels, dilation, uncond=False):
+    def __init__(
+        self,
+        d_cond,
+        residual_channels,
+        dilation,
+        conditioning: Literal["none", "spec", "class"] = "nono",
+    ):
         """
         :param n_mels: inplanes of conv1x1 for spectrogram conditional
         :param residual_channels: audio conv
@@ -104,18 +131,20 @@ class ResidualBlock(nn.Module):
             dilation=dilation,
         )
         self.diffusion_projection = Linear(512, residual_channels)
-        if not uncond:  # conditional model
-            self.conditioner_projection = Conv1d(n_mels, 2 * residual_channels, 1)
+
+        if conditioning == "spec":  # conditional model
+            self.conditioner_projection = Conv1d(d_cond, 2 * residual_channels, 1)
+        elif conditioning == "class":  # conditional model
+            self.conditioner_projection = nn.Sequential(
+                Linear(d_cond, 2 * residual_channels),
+                Unsqueeze(-1),
+            )
         else:  # unconditional model
             self.conditioner_projection = None
 
         self.output_projection = Conv1d(residual_channels, 2 * residual_channels, 1)
 
     def forward(self, x, diffusion_step, conditioner=None):
-        assert (conditioner is None and self.conditioner_projection is None) or (
-            conditioner is not None and self.conditioner_projection is not None
-        )
-
         diffusion_step = self.diffusion_projection(diffusion_step).unsqueeze(-1)
         y = x + diffusion_step
         if self.conditioner_projection is None:  # using a unconditional model
@@ -138,18 +167,26 @@ class DiffWave(nn.Module):
         self.params = params
         self.input_projection = Conv1d(1, params.residual_channels, 1)
         self.diffusion_embedding = DiffusionEmbedding(len(params.noise_schedule))
-        if self.params.unconditional:  # use unconditional model
-            self.spectrogram_upsampler = None
-        else:
+
+        self.spectrogram_upsampler = None
+        self.class_upsampler = None
+        if self.params.cond_type == "spec":
             self.spectrogram_upsampler = SpectrogramUpsampler(params.n_mels)
+        elif self.params.cond_type == "class":
+            # TODO: technically there is no reason we can't have both
+            self.class_upsampler = ClassEmbeddingUpsampler(
+                params.class_embedding_dimension
+            )
 
         self.residual_layers = nn.ModuleList(
             [
                 ResidualBlock(
-                    params.n_mels,
-                    params.residual_channels,
-                    2 ** (i % params.dilation_cycle_length),
-                    uncond=params.unconditional,
+                    d_cond=params.n_mels
+                    if self.spectrogram_upsampler
+                    else params.class_embedding_dimension,
+                    residual_channels=params.residual_channels,
+                    dilation=2 ** (i % params.dilation_cycle_length),
+                    conditioning=params.cond_type,
                 )
                 for i in range(params.residual_layers)
             ]
@@ -160,21 +197,20 @@ class DiffWave(nn.Module):
         self.output_projection = Conv1d(params.residual_channels, 1, 1)
         nn.init.zeros_(self.output_projection.weight)
 
-    def forward(self, audio, diffusion_step, spectrogram=None):
-        assert (spectrogram is None and self.spectrogram_upsampler is None) or (
-            spectrogram is not None and self.spectrogram_upsampler is not None
-        )
+    def forward(self, audio, diffusion_step, conditioner=None):
         x = audio.unsqueeze(1)
         x = self.input_projection(x)
         x = F.relu(x)
 
         diffusion_step = self.diffusion_embedding(diffusion_step)
         if self.spectrogram_upsampler:  # use conditional model
-            spectrogram = self.spectrogram_upsampler(spectrogram)
+            conditioner = self.spectrogram_upsampler(conditioner)
+        elif self.class_upsampler:
+            conditioner = self.class_upsampler(conditioner)
 
         skip = None
         for layer in self.residual_layers:
-            x, skip_connection = layer(x, diffusion_step, spectrogram)
+            x, skip_connection = layer(x, diffusion_step, conditioner)
             skip = skip_connection if skip is None else skip_connection + skip
 
         x = skip / sqrt(len(self.residual_layers))
