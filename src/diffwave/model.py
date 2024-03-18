@@ -123,11 +123,12 @@ class ResidualBlock(nn.Module):
         :param uncond: disable spectrogram conditional
         """
         super().__init__()
+        ksize = 11
         self.dilated_conv = Conv1d(
             residual_channels,
             2 * residual_channels,
-            3,
-            padding=dilation,
+            11,
+            padding=5 * dilation,
             dilation=dilation,
         )
         self.diffusion_projection = Linear(512, residual_channels)
@@ -181,9 +182,11 @@ class DiffWave(nn.Module):
         self.residual_layers = nn.ModuleList(
             [
                 ResidualBlock(
-                    d_cond=params.n_mels
-                    if self.spectrogram_upsampler
-                    else params.class_embedding_dimension,
+                    d_cond=(
+                        params.n_mels
+                        if self.spectrogram_upsampler
+                        else params.class_embedding_dimension
+                    ),
                     residual_channels=params.residual_channels,
                     dilation=2 ** (i % params.dilation_cycle_length),
                     conditioning=params.cond_type,

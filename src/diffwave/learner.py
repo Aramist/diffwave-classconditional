@@ -124,10 +124,8 @@ class DiffWaveLearner:
                 if self.is_master:
                     if self.step % 50 == 0:
                         self._write_summary(self.step, features, loss)
-                        self._write_sample_inference(self.step, features, loss)
                     if self.step % len(self.dataset) == 0:
                         self.save_to_checkpoint()
-                        self._write_sample_inference(self.step, features, loss)
                 self.step += 1
 
     def train_step(self, features):
@@ -204,6 +202,8 @@ class DiffWaveLearner:
                         )
                         T.append(t + twiddle)
                         break
+            # if len(T) < len(alpha):
+            #     T.append(len(training_noise_schedule) - 1)
             T = np.array(T, dtype=np.float32)
 
             conditioner = None
